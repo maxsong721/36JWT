@@ -16,6 +16,8 @@ from datetime import datetime
 from tqdm import tqdm
 import yaml
 import gc
+import threading
+import queue
 
 # 导入模型相关
 from model import model_dict
@@ -182,50 +184,35 @@ class FullResolutionInference:
         self.model.eval()
         
         logger.info("✓ 模型加载完成")
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved  = torch.cuda.memory_reserved()  / 1024**3
+        logger.info(f"  模型加载后显存: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
     
-    def _read_time_series_block(self, x_off, y_off, x_size, y_size):
-        """读取指定位置的时序数据（使用GDAL）
-        
-        Args:
-            x_off: 列起始位置
-            y_off: 行起始位置
-            x_size: 列数（宽度）
-            y_size: 行数（高度）
-            
-        Returns:
-            s2_block: (t, b, h, w) S2时序数据
-            s1_block: (t, b, h, w) S1时序数据（如果使用）
-        """
-        # 读取S2时序
-        s2_list = []
-        for s2_path in self.s2_file_paths:
-            ds = gdal.Open(s2_path)
-            # 读取所有波段
-            bands_data = []
-            for i in range(1, ds.RasterCount + 1):
-                band = ds.GetRasterBand(i)
-                data = band.ReadAsArray(x_off, y_off, x_size, y_size)
-                bands_data.append(data)
-            s2_list.append(np.stack(bands_data, axis=0))  # (b, h, w)
-            ds = None
-        s2_block = np.stack(s2_list, axis=0)  # (t, b, h, w)
-        
-        # 读取S1时序（如果使用）
+
+    def _open_datasets(self):
+        """预先打开所有GDAL数据集，避免每个block重复open/close"""
+        self._s2_ds = [gdal.Open(p) for p in self.s2_file_paths]
         if self.args.with_X_aux:
-            s1_list = []
-            for s1_path in self.s1_file_paths:
-                ds = gdal.Open(s1_path)
-                bands_data = []
-                for i in range(1, ds.RasterCount + 1):
-                    band = ds.GetRasterBand(i)
-                    data = band.ReadAsArray(x_off, y_off, x_size, y_size)
-                    bands_data.append(data)
-                s1_list.append(np.stack(bands_data, axis=0))  # (b, h, w)
-                ds = None
-            s1_block = np.stack(s1_list, axis=0)  # (t, b, h, w)
+            self._s1_ds = [gdal.Open(p) for p in self.s1_file_paths]
+        else:
+            self._s1_ds = []
+        logger.info(f"✓ 预开 {len(self._s2_ds)} 个S2 + {len(self._s1_ds)} 个S1 数据集")
+
+    def _close_datasets(self):
+        self._s2_ds = []
+        self._s1_ds = []
+
+    def _read_time_series_block(self, x_off, y_off, x_size, y_size):
+        """读取指定位置的时序数据（复用预开的GDAL数据集，用ds.ReadAsArray一次读所有波段）"""
+        s2_block = np.stack(
+            [ds.ReadAsArray(x_off, y_off, x_size, y_size) for ds in self._s2_ds], axis=0
+        )  # (t, b, h, w)
+        if self.args.with_X_aux:
+            s1_block = np.stack(
+                [ds.ReadAsArray(x_off, y_off, x_size, y_size) for ds in self._s1_ds], axis=0
+            ).astype(np.float32)
         else:
             s1_block = np.zeros((1, 2, y_size, x_size), dtype=np.float32)
-        
         return s2_block, s1_block
     
     def _preprocess_block(self, s2_block, s1_block):
@@ -297,10 +284,10 @@ class FullResolutionInference:
         """
         n = s2_input.shape[0]
         
-        # 分批推理以避免显存不足
-        # 512×512 = 262144个像素，分成16批，每批16384个像素（约128×128）
-        batch_size = 16384
+        # batch_size 从配置文件读取；OOM时永久减半，后续batch直接用小值
+        batch_size = getattr(self.args, "inference_batch_size", 32768)
         n_batches = (n + batch_size - 1) // batch_size
+        _warned_oom = [False]  # 用列表以便内层函数修改
         
         # 预分配输出数组，避免 np.concatenate 导致的内存峰值（拼接时需要2倍内存）
         t_out = len(self.s2_doy)
@@ -328,10 +315,9 @@ class FullResolutionInference:
             missing_mask_tensor = torch.from_numpy(missing_mask_batch.astype(np.float32)).to(self.device)
             attention_mask_tensor = torch.from_numpy(attention_mask_batch.astype(np.float32)).to(self.device)
             
-            # 用 expand 代替 repeat：不分配新显存，只共享底层存储
             date_input = s2_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous()
             dates_aux = s1_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous() if self.args.with_X_aux else s1_doy_1d
-            date_output = date_input.clone()  # 输出时间点与输入S2 DOY一致
+            date_output = date_input.clone()
             
             inputs = {
                 "date_input": date_input,
@@ -345,14 +331,57 @@ class FullResolutionInference:
                 "date_output": date_output
             }
             
-            # 推理完成后立即写入预分配数组，不在GPU/列表中积累
+            # 推理：OOM时自动将batch切成两半重试，直到成功
             with torch.no_grad():
-                results = self.model(inputs, stage="anytime")
-                output[start_idx:end_idx] = results["reconstructed_data"].cpu().numpy()
-            
-            # 只释放本批次的大张量
-            # 注意：不在循环内调用 empty_cache()，高频调用会触发碎片整理加剧显存碎片
-            del X, X_aux, missing_mask_tensor, attention_mask_tensor, inputs, results
+                if i == 0:
+                    alloc = torch.cuda.memory_allocated() / 1024**3
+                    res   = torch.cuda.memory_reserved()  / 1024**3
+                    logger.info(f"  推理前(block首batch): allocated={alloc:.2f}GB reserved={res:.2f}GB")
+                
+                try:
+                    results = self.model(inputs, stage="anytime")
+                    output[start_idx:end_idx] = results["reconstructed_data"].cpu().numpy()
+                    del results
+                    inputs = inputs  # keep ref for del below
+                except RuntimeError as oom_err:
+                    if "out of memory" not in str(oom_err).lower():
+                        raise
+                    # OOM：永久缩小 batch_size，重新规划剩余 batches
+                    del inputs
+                    inputs = None
+                    torch.cuda.empty_cache()
+                    new_bs = batch_size // 2
+                    if not _warned_oom[0]:
+                        logger.warning(
+                            f"  OOM(batch_size={batch_size}): 永久缩小为 {new_bs}，"
+                            f"后续所有batch均使用新大小"
+                        )
+                        _warned_oom[0] = True
+                    batch_size = new_bs
+                    # 把当前batch用新大小切开重跑
+                    for sub_s in range(start_idx, end_idx, batch_size):
+                        sub_e = min(sub_s + batch_size, end_idx)
+                        sub_len = sub_e - sub_s
+                        sub_inputs = {
+                            "date_input":      s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous(),
+                            "X":               X[sub_s - start_idx : sub_e - start_idx],
+                            "missing_mask":    missing_mask_tensor[sub_s - start_idx : sub_e - start_idx],
+                            "X_holdout":       X[sub_s - start_idx : sub_e - start_idx],
+                            "indicating_mask": missing_mask_tensor[sub_s - start_idx : sub_e - start_idx],
+                            "attention_mask":  attention_mask_tensor[sub_s - start_idx : sub_e - start_idx],
+                            "X_aux":           X_aux[sub_s - start_idx : sub_e - start_idx],
+                            "dates_aux":       s1_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous() if self.args.with_X_aux else s1_doy_1d,
+                            "date_output":     s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous().clone(),
+                        }
+                        sub_res = self.model(sub_inputs, stage="anytime")
+                        output[sub_s:sub_e] = sub_res["reconstructed_data"].cpu().numpy()
+                        del sub_inputs, sub_res
+                    # 更新后续循环的 n_batches（让 i 跳过已处理的像素）
+                    n_batches = (n + batch_size - 1) // batch_size
+
+            del X, X_aux, missing_mask_tensor, attention_mask_tensor
+            if inputs is not None:
+                del inputs
         
         # 整个block推理结束后统一清理一次
         del s2_doy_1d, s1_doy_1d
@@ -381,122 +410,119 @@ class FullResolutionInference:
         
         return output_spatial
     
+    def _io_worker(self, block_queue, done_event, block_coords):
+        """IO预读线程：读取block数据放入队列，与GPU推理并行"""
+        for (row_i, col_j) in block_coords:
+            block_h = min(self.args.block_size, self.height - row_i)
+            block_w = min(self.args.block_size, self.width  - col_j)
+            s2_block, s1_block = self._read_time_series_block(col_j, row_i, block_w, block_h)
+            s2_input, s1_input, missing_mask, attention_mask =                 self._preprocess_block(s2_block, s1_block)
+            del s2_block, s1_block
+            block_queue.put((row_i, col_j, block_h, block_w,
+                             s2_input, s1_input, missing_mask, attention_mask))
+        done_event.set()
+
     def run_inference(self):
-        """执行完整推理流程"""
+        """执行完整推理流程
+        优化：预开数据集 + IO/GPU流水线 + 即时写出（不积累全图）
+        """
         logger.info("=" * 80)
         logger.info("开始推理...")
         logger.info(f"  Block大小: {self.args.block_size} × {self.args.block_size}")
         logger.info(f"  输出时间点数: {len(self.s2_doy)}")
+        logger.info(f"  inference_batch_size: {getattr(self.args, 'inference_batch_size', 32768)}")
         logger.info("=" * 80)
-        
-        # 初始化输出数组
-        t_out = len(self.s2_doy)
+
         b_out = self.n_bands
-        output_arrays = {
-            doy: np.zeros((b_out, self.height, self.width), dtype=np.int16)
-            for doy in self.s2_doy
-        }
-        
-        # 计算block数量
+        block_coords = [
+            (i, j)
+            for i in range(0, self.height, self.args.block_size)
+            for j in range(0, self.width,  self.args.block_size)
+        ]
+        total_blocks = len(block_coords)
         n_blocks_h = int(np.ceil(self.height / self.args.block_size))
-        n_blocks_w = int(np.ceil(self.width / self.args.block_size))
-        total_blocks = n_blocks_h * n_blocks_w
-        
+        n_blocks_w = int(np.ceil(self.width  / self.args.block_size))
         logger.info(f"总共需要处理 {total_blocks} 个blocks ({n_blocks_h} × {n_blocks_w})")
-        
-        # 遍历所有blocks
+
+        # 预开所有GDAL数据集（消除每block的open/close IO开销）
+        logger.info("预开所有GDAL数据集...")
+        self._open_datasets()
+
+        # 预创建所有输出TIF（保持打开，逐block写入，不在内存积累全图）
+        check_path(self.args.output_folder)
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds_dict = {}
+        for doy in self.s2_doy:
+            ymd     = doy_to_ymd(year=self.args.year, doy=int(doy))
+            ymd_str = ymd.replace('-', '')
+            out_path = os.path.join(self.args.output_folder,
+                                    f"S2_L2A_reconstructed_{ymd_str}.tif")
+            ds_out = driver.Create(
+                out_path, self.width, self.height, b_out, gdal.GDT_Int16,
+                options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=512', 'BLOCKYSIZE=512']
+            )
+            ds_out.SetGeoTransform(self.geotransform)
+            ds_out.SetProjection(self.projection)
+            out_ds_dict[doy] = ds_out
+        logger.info(f"✓ 已预创建 {len(out_ds_dict)} 个输出TIF文件")
+
+        # 启动IO预读线程（最多预读3个block，防止内存爆炸）
+        block_queue = queue.Queue(maxsize=3)
+        done_event  = threading.Event()
+        io_thread   = threading.Thread(
+            target=self._io_worker,
+            args=(block_queue, done_event, block_coords),
+            daemon=True
+        )
+        io_thread.start()
+        logger.info("✓ IO预读线程已启动（IO/GPU流水线）")
+
+        # GPU推理主循环
+        pbar = tqdm(total=total_blocks, desc="Block推理进度")
         block_idx = 0
-        for i in tqdm(range(0, self.height, self.args.block_size), desc="行进度"):
-            for j in range(0, self.width, self.args.block_size):
-                block_idx += 1
-                
-                # 计算实际block大小（处理边界）
-                block_h = min(self.args.block_size, self.height - i)
-                block_w = min(self.args.block_size, self.width - j)
-                
-                # GDAL读取参数：x_off, y_off, x_size, y_size
-                x_off = j
-                y_off = i
-                x_size = block_w
-                y_size = block_h
-                
-                # 读取时序数据
-                s2_block, s1_block = self._read_time_series_block(x_off, y_off, x_size, y_size)
-                
-                # 预处理
-                s2_input, s1_input, missing_mask, attention_mask = \
-                    self._preprocess_block(s2_block, s1_block)
-                
-                # 推理
-                output = self._inference_block(s2_input, s1_input, missing_mask, attention_mask)
-                
-                # 后处理
-                output_spatial = self._postprocess_block(output, block_h, block_w)
-                
-                # 写入输出数组
-                for t_idx, doy in enumerate(self.s2_doy):
-                    output_arrays[doy][:, i:i+block_h, j:j+block_w] = output_spatial[t_idx]
-                
-                # 释放内存
-                del s2_block, s1_block, s2_input, s1_input, missing_mask, attention_mask, output, output_spatial
-                
-                if block_idx % 10 == 0:
-                    gc.collect()
-        
-        logger.info("✓ 所有blocks推理完成")
-        
-        # 写入TIF文件
-        self._write_output_tif(output_arrays)
-        
+
+        while not (done_event.is_set() and block_queue.empty()):
+            try:
+                item = block_queue.get(timeout=60)
+            except queue.Empty:
+                continue
+
+            row_i, col_j, block_h, block_w,                 s2_input, s1_input, missing_mask, attention_mask = item
+
+            output = self._inference_block(s2_input, s1_input, missing_mask, attention_mask)
+            del s2_input, s1_input, missing_mask, attention_mask
+
+            output_spatial = self._postprocess_block(output, block_h, block_w)
+            del output
+
+            # 即时写入TIF
+            for t_idx, doy in enumerate(self.s2_doy):
+                for b_idx in range(b_out):
+                    out_ds_dict[doy].GetRasterBand(b_idx + 1).WriteArray(
+                        output_spatial[t_idx, b_idx], xoff=col_j, yoff=row_i
+                    )
+            del output_spatial
+
+            block_idx += 1
+            pbar.update(1)
+            if block_idx % 20 == 0:
+                gc.collect()
+                pbar.set_postfix({"done": f"{block_idx}/{total_blocks}"})
+
+        pbar.close()
+        io_thread.join()
+
+        logger.info("✓ 所有blocks推理完成，正在关闭输出文件...")
+        for doy, ds_out in out_ds_dict.items():
+            for b_idx in range(1, b_out + 1):
+                ds_out.GetRasterBand(b_idx).FlushCache()
+            ds_out = None
+        self._close_datasets()
+
+        logger.info(f"✓ 已写入 {len(self.s2_doy)} 个TIF文件到: {self.args.output_folder}")
         logger.info("=" * 80)
         logger.info("推理完成！")
         logger.info("=" * 80)
-    
-    def _write_output_tif(self, output_arrays):
-        """写入输出TIF文件（使用GDAL）
-        
-        Args:
-            output_arrays: {doy: (b, h, w)} 字典
-        """
-        logger.info(f"写入输出TIF文件到: {self.args.output_folder}")
-        check_path(self.args.output_folder)
-        
-        # 创建GDAL驱动
-        driver = gdal.GetDriverByName('GTiff')
-        
-        for doy in tqdm(self.s2_doy, desc="写入TIF"):
-            # DOY转日期
-            ymd = doy_to_ymd(year=self.args.year, doy=int(doy))
-            ymd_str = ymd.replace('-', '')
-            
-            # 输出文件名
-            output_filename = f"S2_L2A_reconstructed_{ymd_str}.tif"
-            output_path = os.path.join(self.args.output_folder, output_filename)
-            
-            # 创建输出数据集
-            out_ds = driver.Create(
-                output_path,
-                self.width,
-                self.height,
-                self.n_bands,
-                gdal.GDT_Int16,
-                options=['COMPRESS=LZW', 'TILED=YES']
-            )
-            
-            # 设置地理变换和投影
-            out_ds.SetGeoTransform(self.geotransform)
-            out_ds.SetProjection(self.projection)
-            
-            # 写入数据
-            for i in range(self.n_bands):
-                band = out_ds.GetRasterBand(i + 1)
-                band.WriteArray(output_arrays[doy][i])
-                band.FlushCache()
-            
-            # 关闭数据集
-            out_ds = None
-        
-        logger.info(f"✓ 已写入 {len(self.s2_doy)} 个TIF文件")
 
 
 def main():
