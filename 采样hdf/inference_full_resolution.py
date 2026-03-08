@@ -82,10 +82,17 @@ class FullResolutionInference:
             self.X_mean = hf["data"][f"X_mean_{self.args.ratio}"][:]
             self.X_std = hf["data"][f"X_std_{self.args.ratio}"][:]
             
+            # 确保形状正确：应该是(4,)或(1,1,1,4)，统一flatten为(4,)
+            self.X_mean = self.X_mean.flatten()
+            self.X_std = self.X_std.flatten()
+            
             # S1标准化参数（如果使用）
             if self.args.with_X_aux:
                 self.X_aux_mean = hf["data"]["X_aux_mean"][:]
                 self.X_aux_std = hf["data"]["X_aux_std"][:]
+                # 确保形状正确：应该是(3,)
+                self.X_aux_mean = self.X_aux_mean.flatten()
+                self.X_aux_std = self.X_aux_std.flatten()
             else:
                 self.X_aux_mean = np.array([0.0, 0.0])
                 self.X_aux_std = np.array([1.0, 1.0])
@@ -234,7 +241,7 @@ class FullResolutionInference:
             missing_mask: (n, t) 有效观测掩膜
             attention_mask: (n, t) 注意力掩膜
         """
-        t, b, h, w = s2_block.shape
+        t_s2, b_s2, h, w = s2_block.shape
         n = h * w
         
         # S2标准化
@@ -248,23 +255,25 @@ class FullResolutionInference:
         
         # S1标准化
         if self.args.with_X_aux:
+            t_s1, b_s1, _, _ = s1_block.shape
             # 处理NaN
             s1_block = np.nan_to_num(s1_block, nan=0.0)
             # X_aux_mean和X_aux_std的形状是(3,)，需要reshape为(1, 3, 1, 1)
             s1_normalized = (s1_block - self.X_aux_mean[None, :, None, None]) / self.X_aux_std[None, :, None, None]
             s1_normalized = np.where(s1_block != 0, s1_normalized, 0)
+            # Reshape S1: (t_s1, b_s1, h, w) -> (n, t_s1, b_s1)
+            s1_input = s1_normalized.reshape(t_s1, b_s1, -1).transpose(2, 0, 1)
         else:
-            s1_normalized = s1_block
+            s1_input = np.zeros((n, 1, 1), dtype=np.float32)  # 占位符
         
-        # Reshape: (t, b, h, w) -> (n, t, b)
-        s2_input = s2_normalized.reshape(t, b, -1).transpose(2, 0, 1)
-        s1_input = s1_normalized.reshape(t, b, -1).transpose(2, 0, 1)
+        # Reshape S2: (t_s2, b_s2, h, w) -> (n, t_s2, b_s2)
+        s2_input = s2_normalized.reshape(t_s2, b_s2, -1).transpose(2, 0, 1)
         
         # 生成missing_mask: 0是缺失，1是有效
         # 判断条件：值>0 且 值!=NoData 且 值<=10000
         valid_mask = (s2_block > 0) & (s2_block != -32768) & (s2_block <= 10000)
-        valid_mask = valid_mask.all(axis=1)  # (t, h, w) - 所有波段都有效
-        missing_mask = valid_mask.reshape(t, -1).T  # (n, t)
+        valid_mask = valid_mask.all(axis=1)  # (t_s2, h, w) - 所有波段都有效
+        missing_mask = valid_mask.reshape(t_s2, -1).T  # (n, t_s2)
         
         # 生成attention_mask: 0是有效，1是缺失
         # 判断条件：所有波段都是0
@@ -284,41 +293,70 @@ class FullResolutionInference:
         Returns:
             output: (n, t_out, b) 重建后的数据
         """
-        # 转换为tensor
-        date_input = torch.from_numpy(self.s2_doy.astype(np.float32)).to(self.device)
-        date_input = date_input.unsqueeze(0).repeat(s2_input.shape[0], 1)
+        n = s2_input.shape[0]
         
-        X = torch.from_numpy(s2_input.astype(np.float32)).to(self.device)
-        X_aux = torch.from_numpy(s1_input.astype(np.float32)).to(self.device)
-        missing_mask_tensor = torch.from_numpy(missing_mask).to(self.device)
-        attention_mask_tensor = torch.from_numpy(attention_mask).to(self.device)
+        # 分批推理以避免显存不足
+        # 512×512 = 262144个像素，分成16批，每批16384个像素（约128×128）
+        batch_size = 16384
+        n_batches = (n + batch_size - 1) // batch_size
         
-        dates_aux = torch.from_numpy(self.s1_doy.astype(np.float32)).to(self.device)
-        if self.args.with_X_aux:
-            dates_aux = dates_aux.unsqueeze(0).repeat(s2_input.shape[0], 1)
+        # 预分配输出数组，避免 np.concatenate 导致的内存峰值（拼接时需要2倍内存）
+        t_out = len(self.s2_doy)
+        b_out = s2_input.shape[-1]
+        output = np.empty((n, t_out, b_out), dtype=np.float32)
         
-        # 输出时间点：与输入S2的DOY一致
-        date_output = date_input.clone()
+        # 提前把DOY tensor移到GPU，在整个block内复用，不在loop内重复创建+销毁
+        s2_doy_1d = torch.from_numpy(self.s2_doy.astype(np.float32)).to(self.device)
+        s1_doy_1d = torch.from_numpy(self.s1_doy.astype(np.float32)).to(self.device)
         
-        # 构建输入
-        inputs = {
-            "date_input": date_input,
-            "X": X,
-            "missing_mask": missing_mask_tensor,
-            "X_holdout": X,  # 推理时不需要，但模型可能需要
-            "indicating_mask": missing_mask_tensor,  # 推理时不需要
-            "attention_mask": attention_mask_tensor,
-            "X_aux": X_aux,
-            "dates_aux": dates_aux,
-            "date_output": date_output
-        }
+        for i in range(n_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, n)
+            cur_batch = end_idx - start_idx
+            
+            # 获取当前批次数据（numpy切片，零拷贝）
+            s2_batch = s2_input[start_idx:end_idx]
+            s1_batch = s1_input[start_idx:end_idx]
+            missing_mask_batch = missing_mask[start_idx:end_idx]
+            attention_mask_batch = attention_mask[start_idx:end_idx]
+            
+            # 转换为tensor
+            X = torch.from_numpy(s2_batch.astype(np.float32)).to(self.device)
+            X_aux = torch.from_numpy(s1_batch.astype(np.float32)).to(self.device)
+            missing_mask_tensor = torch.from_numpy(missing_mask_batch.astype(np.float32)).to(self.device)
+            attention_mask_tensor = torch.from_numpy(attention_mask_batch.astype(np.float32)).to(self.device)
+            
+            # 用 expand 代替 repeat：不分配新显存，只共享底层存储
+            date_input = s2_doy_1d.unsqueeze(0).expand(cur_batch, -1)
+            dates_aux = s1_doy_1d.unsqueeze(0).expand(cur_batch, -1) if self.args.with_X_aux else s1_doy_1d
+            date_output = date_input  # 推理输出时间点与输入一致，直接复用，无需clone
+            
+            inputs = {
+                "date_input": date_input,
+                "X": X,
+                "missing_mask": missing_mask_tensor,
+                "X_holdout": X,
+                "indicating_mask": missing_mask_tensor,
+                "attention_mask": attention_mask_tensor,
+                "X_aux": X_aux,
+                "dates_aux": dates_aux,
+                "date_output": date_output
+            }
+            
+            # 推理完成后立即写入预分配数组，不在GPU/列表中积累
+            with torch.no_grad():
+                results = self.model(inputs, stage="test")
+                output[start_idx:end_idx] = results["reconstructed_data"].cpu().numpy()
+            
+            # 只释放本批次的大张量
+            # 注意：不在循环内调用 empty_cache()，高频调用会触发碎片整理加剧显存碎片
+            del X, X_aux, missing_mask_tensor, attention_mask_tensor, inputs, results
         
-        # 推理
-        with torch.no_grad():
-            results = self.model(inputs, stage="test")
-            output = results["reconstructed_data"]  # (n, t_out, b)
+        # 整个block推理结束后统一清理一次
+        del s2_doy_1d, s1_doy_1d
+        torch.cuda.empty_cache()
         
-        return output.cpu().numpy()
+        return output
     
     def _postprocess_block(self, output, block_h, block_w):
         """后处理：转换为int16并reshape回空间维度
@@ -560,6 +598,13 @@ def main():
     parser.add_argument("--with_tv", type=str2bool, default=True, help="是否使用TV损失")
     
     args = parser.parse_args()
+    
+    # 设置CUDA内存分配策略，减少碎片化
+    # max_split_size_mb 限制单次分配的最大块大小，缓解 reserved >> allocated 问题
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "max_split_size_mb:512"
+    )
     
     # 设置anytime_ouput为S2的DOY（推理时输出所有S2时间点）
     # 这个参数会在后面根据实际扫描的S2文件动态设置
