@@ -1,0 +1,33 @@
+# 只保留 采样hdf 文件夹，忽略其他所有内容
+/*
+!/采样hdf/
+!.gitignore
+!README.md
+
+# 采样hdf 文件夹内的数据文件
+采样hdf/*.hdf
+采样hdf/*.h5
+采样hdf/*.tif
+采样hdf/*.nc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# 日志文件
+*.log
+
+# PBS 作业输出
+*.o*
+*.e*
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/

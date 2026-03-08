@@ -1,0 +1,106 @@
+#!/bin/bash
+#PBS -N 36KWC_geometry2_anytime_train
+#PBS -q gpu
+#PBS -l nodes=node21:ppn=20:gpus=1
+#PBS -l mem=200gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+#PBS -m ae                 # a=中止, b=开始, e=结束
+#PBS -M 1510733403@qq.com
+
+cd $PBS_O_WORKDIR
+
+source /public/home/xwlin/miniconda3/bin/activate anytime
+
+# 使用 conda 环境的 C++ 库
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+
+# 显示 GPU 信息
+echo "GPU 信息:"
+nvidia-smi
+echo ""
+
+# 自动选择空闲 GPU
+echo "扫描空闲显卡..."
+MAX_WAIT_HOURS=48
+WAIT_INTERVAL=30
+WAITED=0
+
+while true; do
+    FREE_GPU_ID=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F, '$2 < 15000 {print $1; exit}')
+    
+    if [ -n "$FREE_GPU_ID" ]; then
+        echo "找到空闲显卡: GPU $FREE_GPU_ID"
+        export CUDA_VISIBLE_DEVICES=$FREE_GPU_ID
+        break
+    else
+        WAITED=$((WAITED + WAIT_INTERVAL))
+        WAITED_HOURS=$((WAITED / 3600))
+        
+        if [ $WAITED_HOURS -ge $MAX_WAIT_HOURS ]; then
+            echo "错误: 等待超时，正常结束作业"
+            exit 0  # 改为正常退出
+        fi
+        
+        echo "[$(date)] 无空闲 GPU，已等待 $((WAITED/60)) 分钟..."
+        sleep $WAIT_INTERVAL
+    fi
+done
+
+echo "=========================================="
+echo "Job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "GPU: $CUDA_VISIBLE_DEVICES"
+echo "=========================================="
+
+# CUDA 测试
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0)) if torch.cuda.is_available() else exit(1); x=torch.randn(100,100).cuda(); print('GPU test: OK')"
+if [ $? -ne 0 ]; then
+    echo "CUDA 测试失败，正常结束作业"
+    exit 0  # 改为正常退出
+fi
+
+# ========== 36KWC_geometry2 路径配置 ==========
+BASE_DIR="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36KWC_geometry2"
+MODEL_DIR="/public/home/xwlin/Data/songyibo/dataset_for_model/36KWC_geometry2"
+
+WORK_DIR="${MODEL_DIR}/work_dir/anytime"
+ORIGINAL_DATASET_PATH="${MODEL_DIR}/hdf/anytime.hdf"
+
+# 使用第一个S2文件作为参考（根据实际文件名调整）
+REF_TIF_PATH="${BASE_DIR}/S2_remove_cloud/S2_L2A_20240909.tif"
+CONFIG_FILE="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36KWC_geometry2/code/AnytimeFormer-main/configs/36KWC_geometry2/anytime/AnytimeFormer-36KWC_geometry2-40%-r8-128-wTV.yaml"
+
+# 检查参考文件是否存在，如果不存在则尝试其他文件
+if [ ! -f "$REF_TIF_PATH" ]; then
+    echo "警告: $REF_TIF_PATH 不存在，尝试查找其他S2文件..."
+    # 尝试查找存在的S2文件
+    POSSIBLE_FILES=$(find ${BASE_DIR}/S2_remove_cloud/ -name "S2_L2A_*.tif" | head -1)
+    if [ -n "$POSSIBLE_FILES" ]; then
+        REF_TIF_PATH="$POSSIBLE_FILES"
+        echo "使用参考文件: $REF_TIF_PATH"
+    else
+        echo "错误: 找不到任何S2参考文件!"
+        exit 1
+    fi
+fi
+
+# 创建工作目录
+mkdir -p $WORK_DIR
+
+# 切换到 AnytimeFormer 代码目录
+cd /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36KWC_geometry2/code/AnytimeFormer-main
+
+# 运行训练
+python -u main.py \
+    --config_path $CONFIG_FILE \
+    --work_dir $WORK_DIR \
+    --original_dataset_path $ORIGINAL_DATASET_PATH \
+    --ref_tif_path $REF_TIF_PATH \
+    --mode "train_test_anytime" \
+    --debug_mode False \
+    --cal_performance_metric False
+
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "=========================================="

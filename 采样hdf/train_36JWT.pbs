@@ -1,0 +1,75 @@
+#!/bin/bash
+#PBS -N train_36JWT_anytime
+#PBS -q gpu
+#PBS -l nodes=1:ppn=24:gpus=1
+#PBS -l mem=400gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+#PBS -M 1510733403@qq.com
+#PBS -m ae
+
+cd /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main/
+
+source /public/home/xwlin/miniconda3/bin/activate anytime
+
+# 使用 conda 环境的 C++ 库
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+
+echo "=========================================="
+echo "训练36JWT AnytimeFormer模型"
+echo "=========================================="
+echo "Job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Python: $(which python)"
+echo "=========================================="
+echo "GPU信息:"
+nvidia-smi
+echo "=========================================="
+echo "配置信息:"
+echo "- 配置文件: configs/36JWT/anytime/AnytimeFormer-36JWT-40%-r8-128-wTV.yaml"
+echo "- 数据集: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/hdf/anytime.hdf"
+echo "- 工作目录: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime"
+echo "- 模式: train (只训练，不推理)"
+echo "- Batch Size: 512"
+echo "- Epochs: 10"
+echo "- 设备: CUDA"
+echo "- 注意: 推理阶段使用单独的 inference_full_resolution.py 脚本"
+echo "=========================================="
+
+# 运行训练脚本 (只训练，不推理)
+echo "开始训练..."
+python -u main.py \
+    --mode train \
+    --config_path configs/36JWT/anytime/AnytimeFormer-36JWT-40%-r8-128-wTV.yaml \
+    --original_dataset_path /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/hdf/anytime.hdf \
+    --work_dir /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime \
+    --device cuda
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "Exit code: $EXIT_CODE"
+echo "=========================================="
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✓ 训练完成!"
+    echo "模型保存路径: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/"
+    echo ""
+    echo "下一步：使用 inference_full_resolution.py 进行原始分辨率推理"
+    echo "示例命令:"
+    echo "python inference_full_resolution.py \\"
+    echo "  --train_hdf_path /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/hdf/anytime.hdf \\"
+    echo "  --saved_model_path /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/*/models/best_model.ckpt \\"
+    echo "  --s2_tif_folder /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud \\"
+    echo "  --s1_tif_folder /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S1_raw \\"
+    echo "  --output_folder /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/inference_output \\"
+    echo "  --block_size 512 \\"
+    echo "  --ratio 40% \\"
+    echo "  --year 2024"
+else
+    echo "✗ 训练失败，退出码: $EXIT_CODE"
+fi
+
+exit $EXIT_CODE
