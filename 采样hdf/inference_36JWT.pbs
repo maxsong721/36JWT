@@ -40,14 +40,10 @@ echo "- 推理模式: 顺序读取原始TIF"
 echo "- 输出分辨率: 完整分辨率 (10992×10982)"
 echo "=========================================="
 
-# 运行推理脚本（使用默认参数）
+# 运行推理脚本（使用配置文件）
 echo "开始推理..."
 python -u preprocess/inference_full_resolution.py \
-    --block_size 512 \
-    --ratio "40%" \
-    --year 2024 \
-    --with_X_aux True \
-    --device cuda
+    --config_path configs/36JWT/anytime/AnytimeFormer-36JWT-inference-full-res.yaml
 
 EXIT_CODE=$?
 

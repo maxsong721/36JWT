@@ -274,10 +274,12 @@ class FullResolutionInference:
         valid_mask = (s2_block > 0) & (s2_block != -32768) & (s2_block <= 10000)
         valid_mask = valid_mask.all(axis=1)  # (t_s2, h, w) - 所有波段都有效
         missing_mask = valid_mask.reshape(t_s2, -1).T  # (n, t_s2)
+        # 扩展到波段维度: (n, t_s2) -> (n, t_s2, b_s2)
+        missing_mask = np.repeat(missing_mask[:, :, None], b_s2, axis=2)
         
         # 生成attention_mask: 0是有效，1是缺失
         # 判断条件：所有波段都是0
-        attention_mask = (s2_input == 0).all(axis=-1)  # (n, t)
+        attention_mask = (s2_input == 0).all(axis=-1)  # (n, t_s2)
         
         return s2_input, s1_input, missing_mask.astype(np.float32), attention_mask.astype(np.float32)
     
@@ -327,9 +329,9 @@ class FullResolutionInference:
             attention_mask_tensor = torch.from_numpy(attention_mask_batch.astype(np.float32)).to(self.device)
             
             # 用 expand 代替 repeat：不分配新显存，只共享底层存储
-            date_input = s2_doy_1d.unsqueeze(0).expand(cur_batch, -1)
-            dates_aux = s1_doy_1d.unsqueeze(0).expand(cur_batch, -1) if self.args.with_X_aux else s1_doy_1d
-            date_output = date_input  # 推理输出时间点与输入一致，直接复用，无需clone
+            date_input = s2_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous()
+            dates_aux = s1_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous() if self.args.with_X_aux else s1_doy_1d
+            date_output = date_input.clone()  # 输出时间点与输入S2 DOY一致
             
             inputs = {
                 "date_input": date_input,
@@ -345,7 +347,7 @@ class FullResolutionInference:
             
             # 推理完成后立即写入预分配数组，不在GPU/列表中积累
             with torch.no_grad():
-                results = self.model(inputs, stage="test")
+                results = self.model(inputs, stage="anytime")
                 output[start_idx:end_idx] = results["reconstructed_data"].cpu().numpy()
             
             # 只释放本批次的大张量
@@ -612,6 +614,8 @@ def main():
     # 添加其他必需的训练参数（推理时不使用，但模型初始化需要）
     args.artificial_missing_rate = 0.25
     args.gap_mode = "random"
+    args.mode = "test_anytime"  # 推理模式
+    args.debug_mode = False
     args.X_mean = None  # 会在后面设置
     args.X_std = None   # 会在后面设置
     
