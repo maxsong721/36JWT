@@ -126,7 +126,7 @@ class FullResolutionInference:
             date_str = f.split('_')[2]  # 假设格式固定
             self.s2_dates.append(int(date_str))
         
-        # 转换为DOY
+        # 转换为DOY（保持原始 1~365 范围，不做跨年连续化）
         self.s2_doy = np.array([int_to_doy(date) for date in self.s2_dates])
         
         logger.info(f"✓ 找到 {len(self.s2_file_paths)} 个S2文件")
@@ -179,14 +179,19 @@ class FullResolutionInference:
         logger.info(f"加载模型: {self.args.saved_model_path}")
         
         self.model = model_dict[self.args.model_name](self.args)
-        self.model = self.model.to(self.device)
         load_model(self.model, self.args.saved_model_path, logger)
+        # load_model 之后再 to(device)，确保权重加载后整体移到GPU
+        self.model = self.model.to(self.device)
         self.model.eval()
         
-        logger.info("✓ 模型加载完成")
+        # 验证模型确实在GPU上
+        first_param_device = next(self.model.parameters()).device
+        logger.info(f"✓ 模型加载完成，参数设备: {first_param_device}")
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved  = torch.cuda.memory_reserved()  / 1024**3
         logger.info(f"  模型加载后显存: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
+        if allocated < 0.05:
+            logger.warning("  ⚠️  显存接近0，模型可能未正确加载到GPU！请检查 load_model 实现")
     
 
     def _open_datasets(self):
@@ -243,11 +248,14 @@ class FullResolutionInference:
         # S1标准化
         if self.args.with_X_aux:
             t_s1, b_s1, _, _ = s1_block.shape
-            # 处理NaN
-            s1_block = np.nan_to_num(s1_block, nan=0.0)
+            # Keep S1 preprocessing consistent with HDF generation + training:
+            # inf/extreme -> NaN, then fill NaN with 0 before standardization.
+            s1_block = s1_block.astype(np.float32)
+            s1_block[np.isinf(s1_block)] = np.nan
+            s1_block[np.abs(s1_block) > 100] = np.nan
+            s1_block = np.nan_to_num(s1_block, nan=0.0, posinf=0.0, neginf=0.0)
             # X_aux_mean和X_aux_std的形状是(3,)，需要reshape为(1, 3, 1, 1)
             s1_normalized = (s1_block - self.X_aux_mean[None, :, None, None]) / self.X_aux_std[None, :, None, None]
-            s1_normalized = np.where(s1_block != 0, s1_normalized, 0)
             # Reshape S1: (t_s1, b_s1, h, w) -> (n, t_s1, b_s1)
             s1_input = s1_normalized.reshape(t_s1, b_s1, -1).transpose(2, 0, 1)
         else:
@@ -255,6 +263,8 @@ class FullResolutionInference:
         
         # Reshape S2: (t_s2, b_s2, h, w) -> (n, t_s2, b_s2)
         s2_input = s2_normalized.reshape(t_s2, b_s2, -1).transpose(2, 0, 1)
+        # s2_input_full 保留完整数据作为 X_holdout（含云像素的标准化值）
+        s2_input_full = s2_input.copy()
         
         # 生成missing_mask: 0是缺失，1是有效
         # 判断条件：值>0 且 值!=NoData 且 值<=10000
@@ -264,13 +274,40 @@ class FullResolutionInference:
         # 扩展到波段维度: (n, t_s2) -> (n, t_s2, b_s2)
         missing_mask = np.repeat(missing_mask[:, :, None], b_s2, axis=2)
         
+        # 把缺失位置（missing_mask=0）在 s2_input 中置0，作为模型输入 X
+        # 作者做法：X_hat[missing_mask==0] = 0
+        # missing_mask shape: (n, t, b)，s2_input shape: (n, t, b)
+        s2_input = np.where(missing_mask > 0, s2_input, 0.0)
+        
         # 生成attention_mask: 0是有效，1是缺失
-        # 判断条件：所有波段都是0
+        # 作者用 X_hat（置0后）判断，我们也用置0后的 s2_input
         attention_mask = (s2_input == 0).all(axis=-1)  # (n, t_s2)
         
-        return s2_input, s1_input, missing_mask.astype(np.float32), attention_mask.astype(np.float32)
+        # 保护：如果某像素所有时间步都被mask，softmax产生NaN
+        # 策略：强制保留第一个时间步为有效，给模型一个基准点
+        all_masked = attention_mask.all(axis=1)  # (n,) 全程无观测的像素
+        if all_masked.any():
+            attention_mask[all_masked, 0] = 0  # 强制第一个时间步为"有效"
+        
+        # 二次保护：attention_mask全为True的情况（数值上可能因浮点精度残留）
+        # 确保每个像素至少有一个有效时间步
+        mask_sum = attention_mask.sum(axis=1)  # (n,) 每个像素被mask的时间步数
+        t_total = attention_mask.shape[1]
+        fully_masked = mask_sum >= t_total  # 所有时间步都是mask
+        if fully_masked.any():
+            attention_mask[fully_masked, 0] = 0
+        
+        # 关键保护：对角线mask会把"自己对自己"的attention也mask掉
+        # 如果某像素有效观测数 <= 1，仅有的有效key会被对角线mask掉 → softmax全-1e9 → NaN
+        # 解决：有效观测 <= 1 的像素，把 attention_mask 全置0（让模型纯重建）
+        valid_count = (attention_mask == 0).sum(axis=1)  # (n,) 每个像素有效时间步数
+        too_few_valid = valid_count <= 1
+        if too_few_valid.any():
+            attention_mask[too_few_valid] = 0  # 全置0，模型纯重建，不依赖原始观测
+        
+        return s2_input, s2_input_full, s1_input, missing_mask.astype(np.float32), attention_mask.astype(np.float32)
     
-    def _inference_block(self, s2_input, s1_input, missing_mask, attention_mask):
+    def _inference_block(self, s2_input, s2_input_full, s1_input, missing_mask, attention_mask):
         """对单个block进行推理
         
         Args:
@@ -310,7 +347,10 @@ class FullResolutionInference:
             attention_mask_batch = attention_mask[start_idx:end_idx]
             
             # 转换为tensor
+            # s2_batch 是缺失位置置0后的输入X，s2_full_batch 是完整数据X_holdout
+            s2_full_batch = s2_input_full[start_idx:end_idx]
             X = torch.from_numpy(s2_batch.astype(np.float32)).to(self.device)
+            X_holdout = torch.from_numpy(s2_full_batch.astype(np.float32)).to(self.device)
             X_aux = torch.from_numpy(s1_batch.astype(np.float32)).to(self.device)
             missing_mask_tensor = torch.from_numpy(missing_mask_batch.astype(np.float32)).to(self.device)
             attention_mask_tensor = torch.from_numpy(attention_mask_batch.astype(np.float32)).to(self.device)
@@ -323,7 +363,7 @@ class FullResolutionInference:
                 "date_input": date_input,
                 "X": X,
                 "missing_mask": missing_mask_tensor,
-                "X_holdout": X,
+                "X_holdout": X_holdout,
                 "indicating_mask": missing_mask_tensor,
                 "attention_mask": attention_mask_tensor,
                 "X_aux": X_aux,
@@ -339,8 +379,38 @@ class FullResolutionInference:
                     logger.info(f"  推理前(block首batch): allocated={alloc:.2f}GB reserved={res:.2f}GB")
                 
                 try:
+                    if i == 0 and not hasattr(self, '_input_logged'):
+                        self._input_logged = True
+                        logger.info(f"  [诊断] date_input值: {inputs['date_input'][0].tolist()}")
+                        logger.info(f"  [诊断] attention_mask全1的像素数: {(inputs['attention_mask'].all(dim=1)).sum().item()}")
+                        logger.info(f"  [诊断] X的NaN数: {inputs['X'].isnan().sum().item()}")
+                        logger.info(f"  [诊断] X_aux的NaN数: {inputs['X_aux'].isnan().sum().item()}")
+
                     results = self.model(inputs, stage="anytime")
-                    output[start_idx:end_idx] = results["reconstructed_data"].cpu().numpy()
+                    if i == 0 and not hasattr(self, '_result_logged'):
+                        self._result_logged = True
+                        imp = results["imputed_data"]
+                        rec = results["reconstructed_data"]
+                        nan_count = imp.isnan().sum().item()
+                        total = imp.numel()
+                        imp_clean = imp.nan_to_num(0)
+                        logger.info(f"  [诊断] imputed_data: min={imp_clean.min():.4f} max={imp_clean.max():.4f} mean={imp_clean.mean():.4f} NaN={nan_count}/{total} ({nan_count/total*100:.1f}%)")
+                        valid_px = (imp_clean.abs().sum(dim=1).sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+                        if len(valid_px) > 0:
+                            px = valid_px[0].item()
+                            logger.info(f"  [诊断] 有值像素[{px}] t=0: {imp_clean[px,0,:].tolist()}")
+                    imputed = results["imputed_data"]
+                    rec = results["reconstructed_data"]
+                    invalid_imputed = ~torch.isfinite(imputed)
+                    if invalid_imputed.any():
+                        invalid_rec = ~torch.isfinite(rec)
+                        fallback = torch.where(invalid_rec, results["X_holdout"], rec)
+                        imputed = torch.where(invalid_imputed, fallback, imputed)
+                        logger.warning(
+                            f"  [诊断] imputed_data存在非有限值，已用reconstructed/X_holdout回退 "
+                            f"({invalid_imputed.sum().item()} / {imputed.numel()})"
+                        )
+                    output[start_idx:end_idx] = imputed.cpu().numpy()
                     del results
                     inputs = inputs  # keep ref for del below
                 except RuntimeError as oom_err:
@@ -374,7 +444,14 @@ class FullResolutionInference:
                             "date_output":     s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous().clone(),
                         }
                         sub_res = self.model(sub_inputs, stage="anytime")
-                        output[sub_s:sub_e] = sub_res["reconstructed_data"].cpu().numpy()
+                        sub_imputed = sub_res["imputed_data"]
+                        sub_rec = sub_res["reconstructed_data"]
+                        sub_invalid_imputed = ~torch.isfinite(sub_imputed)
+                        if sub_invalid_imputed.any():
+                            sub_invalid_rec = ~torch.isfinite(sub_rec)
+                            sub_fallback = torch.where(sub_invalid_rec, sub_res["X_holdout"], sub_rec)
+                            sub_imputed = torch.where(sub_invalid_imputed, sub_fallback, sub_imputed)
+                        output[sub_s:sub_e] = sub_imputed.cpu().numpy()
                         del sub_inputs, sub_res
                     # 更新后续循环的 n_batches（让 i 跳过已处理的像素）
                     n_batches = (n + batch_size - 1) // batch_size
@@ -402,7 +479,25 @@ class FullResolutionInference:
         """
         # 注意：模型内部已经做了反标准化 (x * std + mean)
         # 这里只需要乘回scale转为int16
+        # 诊断：打印第一个block的输出范围
+        if not hasattr(self, '_postprocess_logged'):
+            self._postprocess_logged = True
+            finite_mask = np.isfinite(output)
+            if finite_mask.any():
+                finite_vals = output[finite_mask]
+                logger.info(
+                    f"  [诊断] output原始范围(有限值): "
+                    f"min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}"
+                )
+            else:
+                logger.warning("  [诊断] output全是非有限值(NaN/Inf)")
+            logger.info(f"  [诊断] output形状: {output.shape}, scale={self.scale}")
+        # NaN兜底：全程被云覆盖的像素模型输出NaN，替换为0
+        output = np.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
         output_int16 = np.round(output * self.scale).astype(np.int16)
+        if not hasattr(self, '_postprocess_int16_logged'):
+            self._postprocess_int16_logged = True
+            logger.info(f"  [诊断] int16范围: min={output_int16.min()}, max={output_int16.max()}, mean={output_int16.mean():.2f}")
         
         # Reshape: (n, t_out, b) -> (t_out, b, h, w)
         output_spatial = output_int16.reshape(block_h, block_w, -1, output_int16.shape[-1])
@@ -416,10 +511,10 @@ class FullResolutionInference:
             block_h = min(self.args.block_size, self.height - row_i)
             block_w = min(self.args.block_size, self.width  - col_j)
             s2_block, s1_block = self._read_time_series_block(col_j, row_i, block_w, block_h)
-            s2_input, s1_input, missing_mask, attention_mask =                 self._preprocess_block(s2_block, s1_block)
+            s2_input, s2_input_full, s1_input, missing_mask, attention_mask =                 self._preprocess_block(s2_block, s1_block)
             del s2_block, s1_block
             block_queue.put((row_i, col_j, block_h, block_w,
-                             s2_input, s1_input, missing_mask, attention_mask))
+                             s2_input, s2_input_full, s1_input, missing_mask, attention_mask))
         done_event.set()
 
     def run_inference(self):
@@ -443,6 +538,13 @@ class FullResolutionInference:
         n_blocks_h = int(np.ceil(self.height / self.args.block_size))
         n_blocks_w = int(np.ceil(self.width  / self.args.block_size))
         logger.info(f"总共需要处理 {total_blocks} 个blocks ({n_blocks_h} × {n_blocks_w})")
+        
+        # 测试模式：只跑前N个block，验证输出正确性
+        test_blocks = getattr(self.args, 'test_blocks', 0)
+        if test_blocks > 0:
+            block_coords = block_coords[:test_blocks]
+            total_blocks = len(block_coords)
+            logger.info(f"⚠️  测试模式: 只跑前 {total_blocks} 个blocks")
 
         # 预开所有GDAL数据集（消除每block的open/close IO开销）
         logger.info("预开所有GDAL数据集...")
@@ -452,11 +554,11 @@ class FullResolutionInference:
         check_path(self.args.output_folder)
         driver = gdal.GetDriverByName('GTiff')
         out_ds_dict = {}
-        for doy in self.s2_doy:
-            ymd     = doy_to_ymd(year=self.args.year, doy=int(doy))
-            ymd_str = ymd.replace('-', '')
+        # 用原始日期字符串（YYYYMMDD）作为文件名，避免跨年DOY转换错误
+        # s2_dates[i] 对应 s2_doy[i]，直接用 date 整数作为文件名
+        for doy, date in zip(self.s2_doy, self.s2_dates):
             out_path = os.path.join(self.args.output_folder,
-                                    f"S2_L2A_reconstructed_{ymd_str}.tif")
+                                    f"S2_L2A_reconstructed_{date}.tif")
             ds_out = driver.Create(
                 out_path, self.width, self.height, b_out, gdal.GDT_Int16,
                 options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=512', 'BLOCKYSIZE=512']
@@ -487,10 +589,10 @@ class FullResolutionInference:
             except queue.Empty:
                 continue
 
-            row_i, col_j, block_h, block_w,                 s2_input, s1_input, missing_mask, attention_mask = item
+            row_i, col_j, block_h, block_w,                 s2_input, s2_input_full, s1_input, missing_mask, attention_mask = item
 
-            output = self._inference_block(s2_input, s1_input, missing_mask, attention_mask)
-            del s2_input, s1_input, missing_mask, attention_mask
+            output = self._inference_block(s2_input, s2_input_full, s1_input, missing_mask, attention_mask)
+            del s2_input, s2_input_full, s1_input, missing_mask, attention_mask
 
             output_spatial = self._postprocess_block(output, block_h, block_w)
             del output
