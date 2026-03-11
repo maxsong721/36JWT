@@ -640,19 +640,19 @@ def main():
     parser.add_argument(
         "--saved_model_path",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt",
+        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt",
         help="训练好的模型路径"
     )
     parser.add_argument(
         "--s2_tif_folder",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud",
+        default="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud/20m",
         help="S2 TIF文件夹路径"
     )
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference",
+        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/inference_20m",
         help="输出文件夹路径"
     )
     
@@ -718,7 +718,7 @@ def main():
     parser.add_argument("--d_v", type=int, default=32, help="value维度")
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout率")
     parser.add_argument("--diagonal_attention_mask", type=str2bool, default=True, help="是否使用对角attention mask")
-    parser.add_argument("--d_feature", type=int, default=4, help="S2波段数")
+    parser.add_argument("--d_feature", type=int, default=6, help="S2波段数")
     parser.add_argument("--d_time", type=int, default=61, help="S2时间步数")
     parser.add_argument("--d_time_aux", type=int, default=70, help="S1时间步数")
     parser.add_argument("--d_feature_aux", type=int, default=3, help="S1波段数")

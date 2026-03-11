@@ -1,0 +1,44 @@
+﻿#!/bin/bash
+#PBS -N inference_36JWT_20m_full_res
+#PBS -q gpu
+#PBS -l nodes=node23:ppn=24:gpus=1
+#PBS -l mem=200gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -M 1510733403@qq.com
+#PBS -m ae
+
+set -eo pipefail
+
+cd /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main/preprocess/20m
+
+source /public/home/xwlin/miniconda3/bin/activate anytime
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main:$PYTHONPATH
+
+CONFIG_PATH="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main/preprocess/20m/AnytimeFormer-36JWT-inference-full-res.yaml"
+
+
+echo "=========================================="
+echo "36JWT Full-resolution inference (20m)"
+echo "=========================================="
+echo "Job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Python: $(which python)"
+echo "GPU info:"
+nvidia-smi
+echo "Config: $CONFIG_PATH"
+echo "=========================================="
+
+python -u inference_full_resolution.py \
+  --config_path "$CONFIG_PATH"
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "Exit code: $EXIT_CODE"
+echo "=========================================="
+
+exit $EXIT_CODE

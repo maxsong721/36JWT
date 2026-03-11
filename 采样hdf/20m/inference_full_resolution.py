@@ -8,6 +8,7 @@
 import os
 import sys
 import argparse
+import calendar
 import h5py
 import numpy as np
 import torch
@@ -18,12 +19,13 @@ import yaml
 import gc
 import threading
 import queue
+import warnings
 
 # 导入模型相关
 from model import model_dict
 from model.utils import (
     setup_logger, seed_torch, load_model, str2bool,
-    check_path, doy_to_ymd
+    check_path
 )
 
 
@@ -64,9 +66,15 @@ class FullResolutionInference:
         
         # 扫描TIF文件
         self._scan_tif_files()
+        self._build_ten_day_schedule()
         
-        # 设置anytime_ouput为S2的DOY（推理时输出所有S2时间点）
-        self.args.anytime_ouput = self.s2_doy.tolist()
+        # 兼容原版模型逻辑：
+        # stage=="anytime" 时只有 len(anytime_ouput)==0 或 ==3 才会走安全分支；
+        # 若传完整日期列表会走默认分支，触发 X(t_in) 与 rec_data(t_out) 维度不一致。
+        # 这里使用长度为3的占位参数，真实输出时相仍由 inputs["date_output"] 控制。
+        first_doy = int(self.output_doy[0]) if len(self.output_doy) > 0 else 1
+        last_doy = int(self.output_doy[-1]) if len(self.output_doy) > 0 else first_doy
+        self.args.anytime_ouput = [first_doy, last_doy, 1]
         
         # 将标准化参数转换为torch tensor并设置到args（模型初始化需要）
         self.args.X_mean = torch.from_numpy(self.X_mean).to(self.device)
@@ -174,6 +182,87 @@ class FullResolutionInference:
         logger.info(f"✓ 影像尺寸: {self.height} × {self.width}")
         logger.info(f"✓ 波段数: {self.n_bands}")
     
+    def _build_ten_day_schedule(self):
+        """构建跨年十天一期窗口（每月 1-10 / 11-20 / 21-月末），输出期中日期与DOY。"""
+        s2_dates_array = np.asarray(self.s2_dates, dtype=np.int32)
+        start_date_int = int(s2_dates_array.min())
+        end_date_int = int(s2_dates_array.max())
+        start_dt = datetime.strptime(str(start_date_int), "%Y%m%d")
+        end_dt = datetime.strptime(str(end_date_int), "%Y%m%d")
+
+        self.period_windows = []  # (start_date_int, end_date_int, mid_date_int)
+        cursor = datetime(start_dt.year, start_dt.month, 1)
+        last_month = datetime(end_dt.year, end_dt.month, 1)
+
+        while cursor <= last_month:
+            year, month = cursor.year, cursor.month
+            last_day = calendar.monthrange(year, month)[1]
+            month_windows = [(1, 10), (11, 20), (21, last_day)]
+
+            for day_start, day_end in month_windows:
+                win_start_dt = datetime(year, month, day_start)
+                win_end_dt = datetime(year, month, day_end)
+                # 仅保留与观测时间范围有交集的窗口
+                if win_end_dt < start_dt or win_start_dt > end_dt:
+                    continue
+
+                mid_day = day_start + (day_end - day_start) // 2
+                win_mid_dt = datetime(year, month, mid_day)
+                win_start_int = int(win_start_dt.strftime("%Y%m%d"))
+                win_end_int = int(win_end_dt.strftime("%Y%m%d"))
+                win_mid_int = int(win_mid_dt.strftime("%Y%m%d"))
+                self.period_windows.append((win_start_int, win_end_int, win_mid_int))
+
+            if month == 12:
+                cursor = datetime(year + 1, 1, 1)
+            else:
+                cursor = datetime(year, month + 1, 1)
+
+        self.output_dates = np.array([item[2] for item in self.period_windows], dtype=np.int32)
+        self.output_doy = np.array([int_to_doy(int(d)) for d in self.output_dates], dtype=np.int16)
+
+        self.period_obs_indices = [
+            np.where((s2_dates_array >= start_date) & (s2_dates_array <= end_date))[0]
+            for start_date, end_date, _ in self.period_windows
+        ]
+
+        missing_periods = [idx for idx, obs_idx in enumerate(self.period_obs_indices) if obs_idx.size == 0]
+        logger.info(
+            f"✓ 十天一期窗口数: {len(self.period_windows)} "
+            f"(date range: {start_date_int} - {end_date_int})"
+        )
+        logger.info(f"  期中日期范围: {self.output_dates[0]} - {self.output_dates[-1]}")
+        logger.info(f"  无真实观测的窗口数: {len(missing_periods)}")
+    
+    def _compose_real_block(self, s2_block):
+        """按十天窗口对原始S2做中值合成，并返回像素级有效掩膜（按波段判定）。"""
+        t_out = len(self.output_doy)
+        _, b, h, w = s2_block.shape
+
+        real_composite = np.zeros((t_out, b, h, w), dtype=np.int16)
+        real_valid_mask = np.zeros((t_out, b, h, w), dtype=bool)
+
+        for period_idx, obs_idx in enumerate(self.period_obs_indices):
+            if obs_idx.size == 0:
+                continue
+            period_data = s2_block[obs_idx]  # (t_period, b, h, w)
+            period_valid = (period_data > 0) & (period_data != -32768) & (period_data <= self.scale)
+            if not period_valid.any():
+                continue
+
+            period_data = period_data.astype(np.float32)
+            period_data[~period_valid] = np.nan
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                period_median = np.nanmedian(period_data, axis=0)
+
+            has_valid = np.any(period_valid, axis=0)
+            period_median = np.where(has_valid, period_median, 0.0)
+            real_composite[period_idx] = np.round(period_median).astype(np.int16)
+            real_valid_mask[period_idx] = has_valid
+
+        return real_composite, real_valid_mask
+    
     def _load_model(self):
         """加载训练好的模型"""
         logger.info(f"加载模型: {self.args.saved_model_path}")
@@ -263,9 +352,6 @@ class FullResolutionInference:
         
         # Reshape S2: (t_s2, b_s2, h, w) -> (n, t_s2, b_s2)
         s2_input = s2_normalized.reshape(t_s2, b_s2, -1).transpose(2, 0, 1)
-        # s2_input_full 保留完整数据作为 X_holdout（含云像素的标准化值）
-        s2_input_full = s2_input.copy()
-        
         # 生成missing_mask: 0是缺失，1是有效
         # 判断条件：值>0 且 值!=NoData 且 值<=10000
         valid_mask = (s2_block > 0) & (s2_block != -32768) & (s2_block <= 10000)
@@ -305,9 +391,9 @@ class FullResolutionInference:
         if too_few_valid.any():
             attention_mask[too_few_valid] = 0  # 全置0，模型纯重建，不依赖原始观测
         
-        return s2_input, s2_input_full, s1_input, missing_mask.astype(np.float32), attention_mask.astype(np.float32)
+        return s2_input, s1_input, missing_mask.astype(np.float32), attention_mask.astype(np.float32)
     
-    def _inference_block(self, s2_input, s2_input_full, s1_input, missing_mask, attention_mask):
+    def _inference_block(self, s2_input, s1_input, missing_mask, attention_mask):
         """对单个block进行推理
         
         Args:
@@ -327,12 +413,13 @@ class FullResolutionInference:
         _warned_oom = [False]  # 用列表以便内层函数修改
         
         # 预分配输出数组，避免 np.concatenate 导致的内存峰值（拼接时需要2倍内存）
-        t_out = len(self.s2_doy)
+        t_out = len(self.output_doy)
         b_out = s2_input.shape[-1]
         output = np.empty((n, t_out, b_out), dtype=np.float32)
         
         # 提前把DOY tensor移到GPU，在整个block内复用，不在loop内重复创建+销毁
         s2_doy_1d = torch.from_numpy(self.s2_doy.astype(np.float32)).to(self.device)
+        output_doy_1d = torch.from_numpy(self.output_doy.astype(np.float32)).to(self.device)
         s1_doy_1d = torch.from_numpy(self.s1_doy.astype(np.float32)).to(self.device)
         
         for i in range(n_batches):
@@ -347,23 +434,20 @@ class FullResolutionInference:
             attention_mask_batch = attention_mask[start_idx:end_idx]
             
             # 转换为tensor
-            # s2_batch 是缺失位置置0后的输入X，s2_full_batch 是完整数据X_holdout
-            s2_full_batch = s2_input_full[start_idx:end_idx]
             X = torch.from_numpy(s2_batch.astype(np.float32)).to(self.device)
-            X_holdout = torch.from_numpy(s2_full_batch.astype(np.float32)).to(self.device)
             X_aux = torch.from_numpy(s1_batch.astype(np.float32)).to(self.device)
             missing_mask_tensor = torch.from_numpy(missing_mask_batch.astype(np.float32)).to(self.device)
             attention_mask_tensor = torch.from_numpy(attention_mask_batch.astype(np.float32)).to(self.device)
             
             date_input = s2_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous()
             dates_aux = s1_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous() if self.args.with_X_aux else s1_doy_1d
-            date_output = date_input.clone()
+            date_output = output_doy_1d.unsqueeze(0).expand(cur_batch, -1).contiguous()
             
             inputs = {
                 "date_input": date_input,
                 "X": X,
                 "missing_mask": missing_mask_tensor,
-                "X_holdout": X_holdout,
+                "X_holdout": X,
                 "indicating_mask": missing_mask_tensor,
                 "attention_mask": attention_mask_tensor,
                 "X_aux": X_aux,
@@ -441,7 +525,7 @@ class FullResolutionInference:
                             "attention_mask":  attention_mask_tensor[sub_s - start_idx : sub_e - start_idx],
                             "X_aux":           X_aux[sub_s - start_idx : sub_e - start_idx],
                             "dates_aux":       s1_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous() if self.args.with_X_aux else s1_doy_1d,
-                            "date_output":     s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous().clone(),
+                            "date_output":     output_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous(),
                         }
                         sub_res = self.model(sub_inputs, stage="anytime")
                         sub_imputed = sub_res["imputed_data"]
@@ -461,7 +545,7 @@ class FullResolutionInference:
                 del inputs
         
         # 整个block推理结束后统一清理一次
-        del s2_doy_1d, s1_doy_1d
+        del s2_doy_1d, output_doy_1d, s1_doy_1d
         torch.cuda.empty_cache()
         
         return output
@@ -511,10 +595,12 @@ class FullResolutionInference:
             block_h = min(self.args.block_size, self.height - row_i)
             block_w = min(self.args.block_size, self.width  - col_j)
             s2_block, s1_block = self._read_time_series_block(col_j, row_i, block_w, block_h)
-            s2_input, s2_input_full, s1_input, missing_mask, attention_mask =                 self._preprocess_block(s2_block, s1_block)
+            real_composite, real_valid_mask = self._compose_real_block(s2_block)
+            s2_input, s1_input, missing_mask, attention_mask = self._preprocess_block(s2_block, s1_block)
             del s2_block, s1_block
             block_queue.put((row_i, col_j, block_h, block_w,
-                             s2_input, s2_input_full, s1_input, missing_mask, attention_mask))
+                             s2_input, s1_input, missing_mask, attention_mask,
+                             real_composite, real_valid_mask))
         done_event.set()
 
     def run_inference(self):
@@ -524,7 +610,7 @@ class FullResolutionInference:
         logger.info("=" * 80)
         logger.info("开始推理...")
         logger.info(f"  Block大小: {self.args.block_size} × {self.args.block_size}")
-        logger.info(f"  输出时间点数: {len(self.s2_doy)}")
+        logger.info(f"  输出十天期数: {len(self.output_doy)}")
         logger.info(f"  inference_batch_size: {getattr(self.args, 'inference_batch_size', 32768)}")
         logger.info("=" * 80)
 
@@ -554,22 +640,23 @@ class FullResolutionInference:
         check_path(self.args.output_folder)
         driver = gdal.GetDriverByName('GTiff')
         out_ds_dict = {}
-        # 用原始日期字符串（YYYYMMDD）作为文件名，避免跨年DOY转换错误
-        # s2_dates[i] 对应 s2_doy[i]，直接用 date 整数作为文件名
-        for doy, date in zip(self.s2_doy, self.s2_dates):
+        # 输出文件按十天窗口期中日命名
+        for period_idx, date in enumerate(self.output_dates):
             out_path = os.path.join(self.args.output_folder,
-                                    f"S2_L2A_reconstructed_{date}.tif")
+                                    f"S2_L2A_10day_fused_{date}.tif")
             ds_out = driver.Create(
                 out_path, self.width, self.height, b_out, gdal.GDT_Int16,
                 options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=512', 'BLOCKYSIZE=512']
             )
             ds_out.SetGeoTransform(self.geotransform)
             ds_out.SetProjection(self.projection)
-            out_ds_dict[doy] = ds_out
+            out_ds_dict[period_idx] = ds_out
         logger.info(f"✓ 已预创建 {len(out_ds_dict)} 个输出TIF文件")
+        real_used_counter = np.zeros(len(self.output_doy), dtype=np.int64)
 
-        # 启动IO预读线程（最多预读3个block，防止内存爆炸）
-        block_queue = queue.Queue(maxsize=3)
+        # 启动IO预读线程（可配置预读block数量，平衡吞吐与内存）
+        prefetch_blocks = max(1, int(getattr(self.args, "prefetch_blocks", 3)))
+        block_queue = queue.Queue(maxsize=prefetch_blocks)
         done_event  = threading.Event()
         io_thread   = threading.Thread(
             target=self._io_worker,
@@ -577,11 +664,12 @@ class FullResolutionInference:
             daemon=True
         )
         io_thread.start()
-        logger.info("✓ IO预读线程已启动（IO/GPU流水线）")
+        logger.info(f"✓ IO预读线程已启动（IO/GPU流水线, prefetch_blocks={prefetch_blocks}）")
 
         # GPU推理主循环
         pbar = tqdm(total=total_blocks, desc="Block推理进度")
         block_idx = 0
+        processed_band_pixels = 0
 
         while not (done_event.is_set() and block_queue.empty()):
             try:
@@ -589,21 +677,26 @@ class FullResolutionInference:
             except queue.Empty:
                 continue
 
-            row_i, col_j, block_h, block_w,                 s2_input, s2_input_full, s1_input, missing_mask, attention_mask = item
+            row_i, col_j, block_h, block_w, s2_input, s1_input, missing_mask, attention_mask, \
+                real_composite, real_valid_mask = item
 
-            output = self._inference_block(s2_input, s2_input_full, s1_input, missing_mask, attention_mask)
-            del s2_input, s2_input_full, s1_input, missing_mask, attention_mask
+            output = self._inference_block(s2_input, s1_input, missing_mask, attention_mask)
+            del s2_input, s1_input, missing_mask, attention_mask
 
             output_spatial = self._postprocess_block(output, block_h, block_w)
             del output
+            fused_output = np.where(real_valid_mask, real_composite, output_spatial).astype(np.int16)
+            real_used_counter += real_valid_mask.reshape(len(self.output_doy), -1).sum(axis=1)
+            processed_band_pixels += int(block_h) * int(block_w) * int(b_out)
+            del real_composite, real_valid_mask, output_spatial
 
             # 即时写入TIF
-            for t_idx, doy in enumerate(self.s2_doy):
+            for t_idx in range(len(self.output_doy)):
                 for b_idx in range(b_out):
-                    out_ds_dict[doy].GetRasterBand(b_idx + 1).WriteArray(
-                        output_spatial[t_idx, b_idx], xoff=col_j, yoff=row_i
+                    out_ds_dict[t_idx].GetRasterBand(b_idx + 1).WriteArray(
+                        fused_output[t_idx, b_idx], xoff=col_j, yoff=row_i
                     )
-            del output_spatial
+            del fused_output
 
             block_idx += 1
             pbar.update(1)
@@ -615,13 +708,21 @@ class FullResolutionInference:
         io_thread.join()
 
         logger.info("✓ 所有blocks推理完成，正在关闭输出文件...")
-        for doy, ds_out in out_ds_dict.items():
+        for _, ds_out in out_ds_dict.items():
             for b_idx in range(1, b_out + 1):
                 ds_out.GetRasterBand(b_idx).FlushCache()
             ds_out = None
         self._close_datasets()
 
-        logger.info(f"✓ 已写入 {len(self.s2_doy)} 个TIF文件到: {self.args.output_folder}")
+        total_band_pixels = processed_band_pixels if processed_band_pixels > 0 else 1
+        for period_idx, used_count in enumerate(real_used_counter):
+            ratio = used_count / total_band_pixels
+            if period_idx < 5 or period_idx >= len(real_used_counter) - 3:
+                logger.info(
+                    f"  十天期#{period_idx + 1:02d} (DOY {self.output_doy[period_idx]}): "
+                    f"真实像素占比={ratio:.3f}, 推理补充占比={1.0 - ratio:.3f}"
+                )
+        logger.info(f"✓ 已写入 {len(self.output_doy)} 个十天一期TIF文件到: {self.args.output_folder}")
         logger.info("=" * 80)
         logger.info("推理完成！")
         logger.info("=" * 80)
@@ -640,19 +741,19 @@ def main():
     parser.add_argument(
         "--saved_model_path",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt",
+        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt",
         help="训练好的模型路径"
     )
     parser.add_argument(
         "--s2_tif_folder",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud",
+        default="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud/20m",
         help="S2 TIF文件夹路径"
     )
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference",
+        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/inference_20m",
         help="输出文件夹路径"
     )
     
@@ -674,6 +775,12 @@ def main():
         type=int,
         default=512,
         help="Window分块大小"
+    )
+    parser.add_argument(
+        "--prefetch_blocks",
+        type=int,
+        default=3,
+        help="IO预读block数量（越大通常越快，但占用更多内存）"
     )
     parser.add_argument(
         "--ratio",
@@ -718,7 +825,7 @@ def main():
     parser.add_argument("--d_v", type=int, default=32, help="value维度")
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout率")
     parser.add_argument("--diagonal_attention_mask", type=str2bool, default=True, help="是否使用对角attention mask")
-    parser.add_argument("--d_feature", type=int, default=4, help="S2波段数")
+    parser.add_argument("--d_feature", type=int, default=6, help="S2波段数")
     parser.add_argument("--d_time", type=int, default=61, help="S2时间步数")
     parser.add_argument("--d_time_aux", type=int, default=70, help="S1时间步数")
     parser.add_argument("--d_feature_aux", type=int, default=3, help="S1波段数")
@@ -753,9 +860,12 @@ def main():
             cfg = yaml.safe_load(f)
         for section in cfg:
             cfg_args = cfg[section]
+            if not isinstance(cfg_args, dict):
+                continue
             for key, value in cfg_args.items():
-                if not hasattr(args, key):
-                    setattr(args, key, value)
+                # 优先级策略：
+                # YAML > CLI 显式传参 > argparse 默认值
+                setattr(args, key, value)
     
     # 设置日志
     log_path = os.path.join(args.output_folder, "inference.log")

@@ -1,0 +1,52 @@
+﻿#!/bin/bash
+#PBS -N inference_36JWT_20m_re
+#PBS -q gpu
+#PBS -l nodes=node21:ppn=24:gpus=1
+#PBS -l mem=200gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -M 1510733403@qq.com
+#PBS -m ae
+
+set -eo pipefail
+
+cd /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main/preprocess/20m
+
+source /public/home/xwlin/miniconda3/bin/activate anytime
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main:$PYTHONPATH
+
+MODEL_PATH="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt"
+S2_FOLDER="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud/20m"
+S1_FOLDER="/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S1_raw"
+OUT_FOLDER="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/inference_re_20m"
+
+echo "=========================================="
+echo "36JWT Reconstructed inference (20m)"
+echo "=========================================="
+echo "Job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Python: $(which python)"
+echo "GPU info:"
+nvidia-smi
+echo "Model: $MODEL_PATH"
+echo "S2 folder: $S2_FOLDER"
+echo "S1 folder: $S1_FOLDER"
+echo "Output folder: $OUT_FOLDER"
+echo "=========================================="
+
+python -u inference_re.py \
+  --saved_model_path "$MODEL_PATH" \
+  --s2_tif_folder "$S2_FOLDER" \
+  --s1_tif_folder "$S1_FOLDER" \
+  --output_folder "$OUT_FOLDER"
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "Exit code: $EXIT_CODE"
+echo "=========================================="
+
+exit $EXIT_CODE

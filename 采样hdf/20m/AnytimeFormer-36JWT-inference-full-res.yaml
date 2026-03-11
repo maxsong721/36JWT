@@ -1,0 +1,33 @@
+﻿model:
+  model_name: "AnytimeFormer"
+  with_atten_mask: false
+  n_groups: 2
+  n_group_inner_layers: 1
+  d_model: 128
+  d_inner: 64
+  n_head: 4
+  d_k: 32
+  d_v: 32
+  dropout: 0.1
+  diagonal_attention_mask: true
+  d_feature: 6
+  d_time: 61
+  with_X_aux: true
+  d_time_aux: 70
+  d_feature_aux: 3
+  learn_emb: false
+  rank: 8
+
+inference:
+  train_hdf_path: "/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/hdf/anytime.hdf"
+  saved_model_path: "/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt"
+  s2_tif_folder: "/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud/20m"
+  s1_tif_folder: "/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S1_raw"
+  output_folder: "/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime_20m_train/2026-03-11_T01-15-47_AnytimeFormer-36JWT-40%-r8-128-wTV/inference_20m"
+  ratio: "40%"
+  scale: 10000
+  device: "cuda"
+  block_size: 512
+  inference_batch_size: 32768
+  prefetch_blocks: 3
+  test_blocks: 0

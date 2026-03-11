@@ -1,12 +1,12 @@
 #!/bin/bash
-#PBS -N 36KWC_geometry2_anytime_train
-#PBS -q gpu
-#PBS -l nodes=node21:ppn=20:gpus=1
+#PBS -N generate_hdf_36JWT_3x3
+#PBS -q normal
+#PBS -l nodes=1:ppn=30
 #PBS -l mem=200gb
-#PBS -l walltime=48:00:00
+#PBS -l walltime=24:00:00
 #PBS -j oe
-#PBS -m ae                 # a=中止, b=开始, e=结束
 #PBS -M 1510733403@qq.com
+#PBS -m ae
 
 cd $PBS_O_WORKDIR
 

@@ -1,0 +1,42 @@
+﻿#!/bin/bash
+#PBS -N generate_hdf_36JWT_3x3
+#PBS -q normal
+#PBS -l nodes=1:ppn=30
+#PBS -l mem=200gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -M 1510733403@qq.com
+#PBS -m ae
+
+set -eo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+echo "[STEP] activate conda env: anytime"
+source /public/home/xwlin/miniconda3/bin/activate anytime
+echo "[STEP] conda env activated"
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+echo "[STEP] LD_LIBRARY_PATH configured"
+
+echo "=========================================="
+echo "CPU HDF job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "Working dir: $(pwd)"
+echo "=========================================="
+
+SCRIPT_DIR="$PBS_O_WORKDIR"
+SCRIPT_PATH="$(find "$SCRIPT_DIR" -maxdepth 1 -name 'hdf_36JWT_3*3.py' | head -1)"
+if [ -z "$SCRIPT_PATH" ]; then
+    echo "[ERROR] hdf script not found in $SCRIPT_DIR"
+    exit 1
+fi
+echo "[STEP] script path: $SCRIPT_PATH"
+echo "[STEP] python: $(which python)"
+echo "[STEP] python version: $(python -V 2>&1)"
+echo "[STEP] start hdf generation"
+python -u "$SCRIPT_PATH"
+echo "[STEP] hdf generation completed"
+
+echo "=========================================="
+echo "CPU HDF job finished at: $(date)"
+echo "=========================================="

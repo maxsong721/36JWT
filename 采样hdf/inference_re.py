@@ -389,28 +389,24 @@ class FullResolutionInference:
                     results = self.model(inputs, stage="anytime")
                     if i == 0 and not hasattr(self, '_result_logged'):
                         self._result_logged = True
-                        imp = results["imputed_data"]
                         rec = results["reconstructed_data"]
-                        nan_count = imp.isnan().sum().item()
-                        total = imp.numel()
-                        imp_clean = imp.nan_to_num(0)
-                        logger.info(f"  [诊断] imputed_data: min={imp_clean.min():.4f} max={imp_clean.max():.4f} mean={imp_clean.mean():.4f} NaN={nan_count}/{total} ({nan_count/total*100:.1f}%)")
-                        valid_px = (imp_clean.abs().sum(dim=1).sum(dim=1) > 0).nonzero(as_tuple=True)[0]
+                        nan_count = rec.isnan().sum().item()
+                        total = rec.numel()
+                        rec_clean = rec.nan_to_num(0)
+                        logger.info(f"  [诊断] reconstructed_data: min={rec_clean.min():.4f} max={rec_clean.max():.4f} mean={rec_clean.mean():.4f} NaN={nan_count}/{total} ({nan_count/total*100:.1f}%)")
+                        valid_px = (rec_clean.abs().sum(dim=1).sum(dim=1) > 0).nonzero(as_tuple=True)[0]
                         if len(valid_px) > 0:
                             px = valid_px[0].item()
-                            logger.info(f"  [诊断] 有值像素[{px}] t=0: {imp_clean[px,0,:].tolist()}")
-                    imputed = results["imputed_data"]
+                            logger.info(f"  [诊断] 有值像素[{px}] t=0: {rec_clean[px,0,:].tolist()}")
                     rec = results["reconstructed_data"]
-                    invalid_imputed = ~torch.isfinite(imputed)
-                    if invalid_imputed.any():
-                        invalid_rec = ~torch.isfinite(rec)
-                        fallback = torch.where(invalid_rec, results["X_holdout"], rec)
-                        imputed = torch.where(invalid_imputed, fallback, imputed)
+                    invalid_rec = ~torch.isfinite(rec)
+                    if invalid_rec.any():
+                        rec = torch.where(invalid_rec, results["X_holdout"], rec)
                         logger.warning(
-                            f"  [诊断] imputed_data存在非有限值，已用reconstructed/X_holdout回退 "
-                            f"({invalid_imputed.sum().item()} / {imputed.numel()})"
+                            f"  [诊断] reconstructed_data存在非有限值，已用X_holdout回退 "
+                            f"({invalid_rec.sum().item()} / {rec.numel()})"
                         )
-                    output[start_idx:end_idx] = imputed.cpu().numpy()
+                    output[start_idx:end_idx] = rec.cpu().numpy()
                     del results
                     inputs = inputs  # keep ref for del below
                 except RuntimeError as oom_err:
@@ -436,7 +432,7 @@ class FullResolutionInference:
                             "date_input":      s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous(),
                             "X":               X[sub_s - start_idx : sub_e - start_idx],
                             "missing_mask":    missing_mask_tensor[sub_s - start_idx : sub_e - start_idx],
-                            "X_holdout":       X[sub_s - start_idx : sub_e - start_idx],
+                            "X_holdout":       X_holdout[sub_s - start_idx : sub_e - start_idx],
                             "indicating_mask": missing_mask_tensor[sub_s - start_idx : sub_e - start_idx],
                             "attention_mask":  attention_mask_tensor[sub_s - start_idx : sub_e - start_idx],
                             "X_aux":           X_aux[sub_s - start_idx : sub_e - start_idx],
@@ -444,14 +440,11 @@ class FullResolutionInference:
                             "date_output":     s2_doy_1d.unsqueeze(0).expand(sub_len,-1).contiguous().clone(),
                         }
                         sub_res = self.model(sub_inputs, stage="anytime")
-                        sub_imputed = sub_res["imputed_data"]
                         sub_rec = sub_res["reconstructed_data"]
-                        sub_invalid_imputed = ~torch.isfinite(sub_imputed)
-                        if sub_invalid_imputed.any():
-                            sub_invalid_rec = ~torch.isfinite(sub_rec)
-                            sub_fallback = torch.where(sub_invalid_rec, sub_res["X_holdout"], sub_rec)
-                            sub_imputed = torch.where(sub_invalid_imputed, sub_fallback, sub_imputed)
-                        output[sub_s:sub_e] = sub_imputed.cpu().numpy()
+                        sub_invalid_rec = ~torch.isfinite(sub_rec)
+                        if sub_invalid_rec.any():
+                            sub_rec = torch.where(sub_invalid_rec, sub_res["X_holdout"], sub_rec)
+                        output[sub_s:sub_e] = sub_rec.cpu().numpy()
                         del sub_inputs, sub_res
                     # 更新后续循环的 n_batches（让 i 跳过已处理的像素）
                     n_batches = (n + batch_size - 1) // batch_size
@@ -640,7 +633,7 @@ def main():
     parser.add_argument(
         "--saved_model_path",
         type=str,
-        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt",
+        default="/public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/models/model_epoch_4_metric_0.00096.ckpt",
         help="训练好的模型路径"
     )
     parser.add_argument(

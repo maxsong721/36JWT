@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -N inference_36JWT_full_res
+#PBS -q gpu
+#PBS -l nodes=node21:ppn=24:gpus=1
+#PBS -l mem=200gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -M 1510733403@qq.com
+#PBS -m ae
+
+cd /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main
+
+source /public/home/xwlin/miniconda3/bin/activate anytime
+
+# 使用 conda 环境的 C++ 库
+export LD_LIBRARY_PATH=/public/home/xwlin/miniconda3/envs/anytime/lib:$LD_LIBRARY_PATH
+
+# 添加当前目录到Python路径
+export PYTHONPATH=/public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/code/AnytimeFormer-main:$PYTHONPATH
+
+echo "=========================================="
+echo "36JWT 原始分辨率推理"
+echo "=========================================="
+echo "Job started at: $(date)"
+echo "Running on node: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Python: $(which python)"
+echo "=========================================="
+echo "GPU信息:"
+nvidia-smi
+echo "=========================================="
+echo "配置信息:"
+echo "- 训练HDF: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/hdf/anytime.hdf"
+echo "- 模型路径: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/models/best_model.ckpt"
+echo "- S2文件夹: /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S2_remove_cloud"
+echo "- S1文件夹: /public/home/xwlin/Data/songyibo/dataset_down_from_GEE/36JWT/S1_raw"
+echo "- 输出文件夹: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference"
+echo "- Block大小: 512×512"
+echo "- 推理模式: 顺序读取原始TIF"
+echo "- 输出分辨率: 完整分辨率 (10992×10982)"
+echo "=========================================="
+
+# 运行推理脚本（使用配置文件）
+echo "开始推理..."
+python -u preprocess/inference_re.py \
+    --config_path configs/36JWT/anytime/AnytimeFormer-36JWT-inference-full-res.yaml
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished at: $(date)"
+echo "Exit code: $EXIT_CODE"
+echo "=========================================="
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✓ 推理完成!"
+    echo "输出路径: /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference/"
+    echo ""
+    echo "输出文件列表:"
+    ls -lh /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference/*.tif | head -10
+    echo "..."
+    echo "总共文件数:"
+    ls /public/home/xwlin/Data/songyibo/dataset_for_model/36JWT/work_dir/anytime/2026-03-07_T19-01-55_AnytimeFormer-36JWT-40%-r8-128-wTV/inference/*.tif | wc -l
+else
+    echo "✗ 推理失败，退出码: $EXIT_CODE"
+fi
+
+exit $EXIT_CODE
